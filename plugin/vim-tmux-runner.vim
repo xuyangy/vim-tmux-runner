@@ -22,7 +22,7 @@ function! s:CreateRunnerPane(...)
         let g:VtrInitialCommand = s:DictFetch(a:1, 'cmd', g:VtrInitialCommand)
     endif
     let s:vim_pane = s:ActivePaneIndex()
-    let cmd = join(["split-window -p", s:vtr_percentage, "-".s:vtr_orientation])
+    let cmd = join(["split-window -l", s:vtr_percentage.."%", "-".s:vtr_orientation])
     call s:SendTmuxCommand(cmd)
     call s:SendTmuxCommand('select-pane -T '.g:VtrCreatedRunnerPaneName)
     let s:runner_pane = s:ActivePaneIndex()
@@ -459,16 +459,114 @@ function! s:SendLinesToRunner(ensure_pane) range
     call s:SendTextToRunner(getline(a:firstline, a:lastline))
 endfunction
 
+function! s:GetVisualSelection(mode, vmode)
+    " call with visualmode() as the argument
+    if a:mode == "v"
+        let [line_start, column_start] = getpos("v")[1:2]
+        let [line_end, column_end] = getpos(".")[1:2]
+    else
+        let [line_start, column_start] = getpos("'<")[1:2]
+        let [line_end, column_end] = getpos("'>")[1:2]
+    end
+
+    if (line2byte(line_start)+column_start) > (line2byte(line_end)+column_end)
+        let [line_start, column_start, line_end, column_end] = [line_end, column_end, line_start, column_start]
+    end
+
+    let lines = getline(line_start, line_end)
+    if a:vmode ==# 'v'
+        " Must trim the end before the start, the beginning will shift left.
+        let lines[-1] = lines[-1][: column_end - (&selection == 'inclusive' ? 1 : 2)]
+        let lines[0] = lines[0][column_start - 1:]
+    elseif  a:vmode ==# 'V'
+        " Line mode no need to trim start or end
+    elseif  a:vmode == "\<c-v>"
+        " " Block mode, trim every line
+        " let new_lines = []
+        " let i = 0
+        " for line in lines
+        "     let lines[i] = line[column_start - 1: column_end - (&selection == 'inclusive' ? 1 : 2)]
+        "     let i = i + 1
+        " endfor
+        normal! gv"zy
+        return getreg('z', 1, 1)
+    else
+        return ''
+    endif
+    return lines
+endfunction
+
+function! s:SendVisualSelectionToRunner(ensure_pane) range
+    if a:ensure_pane | call s:EnsureRunnerPane() | endif
+    if !s:ValidRunnerPaneSet() | return | endif
+    call s:SendTmuxCopyModeExit()
+    call s:SendTextToRunner(s:GetVisualSelection(mode(), visualmode()))
+endfunction
+
+" send cursor WORD to runner, repeat for each line if range of multiple lines
+function! s:SendLeadingWORDToRunner(ensure_pane)
+    if a:ensure_pane | call s:EnsureRunnerPane() | endif
+    if !s:ValidRunnerPaneSet() | return | endif
+    call s:SendTmuxCopyModeExit()
+    let currentLine = getline('.')
+    let cWORD = substitute(currentLine, '^\s*\(\S\+\)\s*.*', '\1', '')
+    let send_keys_cmd = s:TargetedTmuxCommand("send-keys", s:runner_pane)
+    let targeted_cmd = send_keys_cmd . ' ' . shellescape(cWORD. "\r")
+    call s:SendTmuxCommand(targeted_cmd)
+endfunction
+
+" send cursor WORD to runner, repeat for each line if range of multiple lines
+function! s:SendLeadingWordToRunner(ensure_pane)
+    if a:ensure_pane | call s:EnsureRunnerPane() | endif
+    if !s:ValidRunnerPaneSet() | return | endif
+    call s:SendTmuxCopyModeExit()
+    let currentLine = getline('.')
+    let cWORD = substitute(currentLine, '^\s*\(\k\+\)\s*.*', '\1', '')
+    let send_keys_cmd = s:TargetedTmuxCommand("send-keys", s:runner_pane)
+    let targeted_cmd = send_keys_cmd . ' ' . shellescape(cWORD. "\r")
+    call s:SendTmuxCommand(targeted_cmd)
+endfunction
+
+function! RemoveUnnecessaryEmptylines(lines)
+  let num_lines = len(a:lines)
+    let line_num = 0
+    while line_num < num_lines - 1
+        let current_line = a:lines[line_num]
+        let next_line = a:lines[line_num + 1]
+
+        if current_line =~ '^\s*$' && next_line =~ '^\s'
+            call remove(a:lines, line_num )
+            let num_lines = num_lines - 1
+        else
+            let line_num = line_num + 1
+        endif
+    endwhile
+
+    return a:lines
+
+endfunction
+
+
 function! s:PrepareLines(lines)
     let prepared = a:lines
     if g:VtrStripLeadingWhitespace
         let prepared = map(a:lines, 'substitute(v:val,"^\\s*","","")')
     endif
+    " remove first line leading whitespaces from all lines
+    if g:VtrStripFirstLineWhitespaceForAll
+        let count = strlen(matchstr(get(a:lines, 0), '^\s*'))
+        let prepared = map(prepared, 'substitute(v:val,"^\\s\\{'.count.'}","","")')
+    endif
     if g:VtrClearEmptyLines
         let prepared = filter(prepared, "!empty(v:val)")
     endif
+    " after VtrStripFirstLineWhitespaceForAll
+    " remove an empty line followed by a line with leading whitespace
+    if g:VtrStripFirstLineWhitespaceForAll && g:VtrClearTrivialEmptyLines
+        let prepared = RemoveUnnecessaryEmptylines(prepared)
+    endif
     if g:VtrAppendNewline && len(a:lines) > 1
-        let prepared = add(prepared, "\r")
+        let prepared = add(prepared, "")  " newline appended when SendTmuxCommand
     endif
     return prepared
 endfunction
@@ -522,6 +620,9 @@ endfunction
 function! s:DefineCommands()
     command! -bang -nargs=? VtrSendCommandToRunner call s:SendCommandToRunner(<bang>0, <f-args>)
     command! -bang -range VtrSendLinesToRunner <line1>,<line2>call s:SendLinesToRunner(<bang>0)
+    command! -bang -range VtrSendLeadingWORDToRunner <line1>,<line2>call s:SendLeadingWORDToRunner(<bang>0)
+    command! -bang -range VtrSendLeadingWordToRunner <line1>,<line2>call s:SendLeadingWordToRunner(<bang>0)
+    command! -bang -range VtrSendVisualSelectionToRunner <line1>,<line2>call s:SendVisualSelectionToRunner(<bang>0)
     command! -bang VtrSendFile call s:SendFileViaVtr(<bang>0)
     command! -nargs=? VtrOpenRunner call s:EnsureRunnerPane(<args>)
     command! VtrKillRunner call s:KillRunnerPane()
